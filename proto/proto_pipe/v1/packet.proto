@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package proto_pipe.v1;
+
+import "google/protobuf/any.proto";
+
+// Wire framing for a generic RPC transport over a bidirectional pipe.
+//
+// All four RPC shapes (unary, server-streaming, client-streaming, bidi) are
+// multiplexed over one stream of RequestPackets (client -> server) and one sink of
+// ResponsePackets (server -> client), correlated by `req_id`. Any bidi pipe backs it
+// by bridging (Stream<RequestPacket>, Sink<ResponsePacket>). The transport must be
+// message-oriented or length-delimit packets.
+
+// A client -> server frame for one call.
+//
+// Lifetime: single-request calls (unary/server-streaming) send Begin with
+// `single_request` set and nothing further. Streaming-request calls
+// (client-streaming/bidi) send Begin without it, then zero-or-more Message, then
+// exactly one DoneSending. Cancel may be sent at any time instead and aborts both
+// directions. The client never sends a status or trailers.
+message RequestPacket {
+  // Call id, allocated by the client: unique and monotonically increasing for the
+  // life of one pipe connection, never reused. 0 is reserved as invalid (so an absent
+  // field is not mistaken for a call); allocation starts at 1. The client is the sole
+  // allocator and the server never opens a call, so ids are per-connection with no
+  // cross-connection or parity coordination.
+  uint64 req_id = 1;
+
+  oneof frame {
+    // Opens the call. Must be the first frame for this req_id.
+    Begin begin = 2;
+    // A streaming request message body. Client-streaming/bidi only; single-request
+    // calls carry their payload in Begin.
+    Message message = 3;
+    // Client's send half is closed; the response direction stays open. Sent exactly
+    // once by streaming-request calls, never by single-request calls (Begin already
+    // closed their send half). Not an abort -- see Cancel.
+    DoneSending done_sending = 4;
+    // Abort the call in both directions. After sending Cancel the client frees state
+    // immediately and ignores any further frames for this req_id; the server stops
+    // emitting once it observes Cancel, though in-flight frames may still arrive. A
+    // terminal Close may or may not follow, so it is not the cleanup signal. Cancel
+    // for an unknown or already-closed req_id is a no-op.
+    Cancel cancel = 5;
+  }
+
+  message Begin {
+    string method = 1;    // "/package.Service/Method"
+    Metadata headers = 2; // leading call metadata (deadline, auth, ...)
+    // The entire encoded request for single-request shapes; absent for
+    // streaming-request shapes. `optional` so an empty encoded message stays
+    // distinguishable from absent.
+    optional bytes single_request = 3;
+  }
+  message Message {
+    bytes body = 1;       // encoded request message
+  }
+  message DoneSending {}
+  message Cancel {}
+}
+
+// A server -> client frame for one call.
+//
+// Lifetime: optional Headers, zero-or-more Message, then at most one Close -- exactly
+// one on the normal (uncancelled) path -- after which nothing follows. Single-response
+// calls (unary/client-streaming) normally send Close alone, carrying
+// `single_response`; errors are Close-only for every shape. Only the server sends
+// Close/trailers.
+message ResponsePacket {
+  uint64 req_id = 1;
+
+  oneof frame {
+    // Leading response metadata. Optional, at most once, before any Message.
+    // Streaming-response calls only; single-response calls carry headers in Close.
+    Headers headers = 2;
+    // A streaming response message body. Server-streaming/bidi only; single-response
+    // calls carry their payload in Close.
+    Message message = 3;
+    // Terminal frame: status + trailing metadata. At most one per call; ends it, and
+    // nothing follows.
+    Close close = 4;
+  }
+
+  message Headers {
+    Metadata metadata = 1;
+  }
+  message Message {
+    bytes body = 1;        // encoded response message
+  }
+  message Close {
+    Status status = 1;
+    Metadata trailers = 2; // trailing metadata
+    // The entire encoded response for single-response shapes; such calls send no
+    // Message frames. Present only when `status` is OK. `optional` for the same
+    // presence reason as Begin.single_request.
+    optional bytes single_response = 3;
+    // Leading metadata for single-response shapes; streaming-response calls send a
+    // Headers frame instead.
+    Metadata headers = 4;
+  }
+}
+
+// Terminal call status. Mirrors google.rpc.Status: a numeric code, a human-readable
+// message, and optional typed error details. `code` follows the gRPC / google.rpc.Code
+// values (0 = OK ... 16 = UNAUTHENTICATED) and is kept as an int -- like
+// google.rpc.Status -- so it maps straight onto each client's own status-code type.
+message Status {
+  int32 code = 1;
+  string message = 2;
+  repeated google.protobuf.Any details = 3;
+}
+
+// Call metadata: leading (Begin.headers, ResponsePacket.Headers) and trailing
+// (Close.trailers). A multimap -- keys may repeat. Keys are lowercase ASCII, compared
+// case-insensitively (HTTP/gRPC header semantics). Values are ASCII strings (as in
+// Wire's Map<String,String> and Connect's Headers); for the rare binary case, use the
+// gRPC "-bin" key convention with a base64-encoded value.
+message Metadata {
+  repeated Entry entries = 1;
+  message Entry {
+    string key = 1;
+    string value = 2;
+  }
+}

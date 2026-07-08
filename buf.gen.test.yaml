@@ -1,0 +1,9 @@
+version: v2
+inputs:
+  - directory: Tests/proto
+plugins:
+  - remote: buf.build/apple/swift
+    out: Tests/ProtoServicePipeTests/Generated
+  - remote: buf.build/connectrpc/swift
+    out: Tests/ProtoServicePipeTests/Generated
+    opt: GenerateCallbackMethods=true
