@@ -1,0 +1,13 @@
+syntax = "proto3";
+package example.v1;
+
+message Ping { string msg = 1; }
+message Pong { string msg = 1; }
+
+// Exercises all four RPC shapes against a generated server.
+service Greeter {
+  rpc Unary(Ping) returns (Pong);
+  rpc ClientStream(stream Ping) returns (Pong);
+  rpc ServerStream(Ping) returns (stream Pong);
+  rpc Bidi(stream Ping) returns (stream Pong);
+}
