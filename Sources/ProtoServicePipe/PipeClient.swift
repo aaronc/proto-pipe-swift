@@ -16,6 +16,12 @@ public final class PipeClient: @unchecked Sendable {
         var nextReqID: UInt64 = 1
         var sessions = [UInt64: Session]()
         var isShutdown = false
+        /// Encoded packets awaiting `sendData`, in wire order. Queued under the lock (so
+        /// a Begin's position is fixed in the same critical section that allocates its
+        /// req_id) and drained outside it by `flush()`.
+        var outbox = [Data]()
+        /// A thread is draining `outbox`; others just enqueue and leave.
+        var isFlushing = false
     }
 
     /// One in-flight call, type-erased. Closures are invoked outside the client's lock,
@@ -107,28 +113,63 @@ public final class PipeClient: @unchecked Sendable {
         return self.state.withLock { $0.sessions[reqID] != nil }
     }
 
-    private func allocateReqID() -> UInt64 {
+    /// Start a call: allocate its req_id, register the session built for it, and queue
+    /// its Begin -- in one critical section, so Begins reach the pipe in req_id order no
+    /// matter how many threads start calls at once. The server requires strictly
+    /// increasing req_ids and drops the whole connection on a regression, so allocating
+    /// and sending separately lets two racing calls kill every call on the pipe.
+    ///
+    /// Returns nil, registering nothing, if the client is shut down. The caller must
+    /// `flush()` afterwards (outside any lock of its own).
+    private func queueCall(
+        _ begin: ProtoPipe_V1_RequestPacket.Begin,
+        session makeSession: (UInt64) -> Session
+    ) -> UInt64? {
         return self.state.withLock { state in
+            guard !state.isShutdown else { return nil }
             let reqID = state.nextReqID
             state.nextReqID += 1
+            state.sessions[reqID] = makeSession(reqID)
+            state.outbox.append(Self.encode(.begin(begin), reqID: reqID))
             return reqID
         }
     }
 
-    /// Returns false (without inserting) if the client is shut down.
-    private func insert(_ session: Session, reqID: UInt64) -> Bool {
-        return self.state.withLock { state in
-            guard !state.isShutdown else { return false }
-            state.sessions[reqID] = session
+    func sendFrame(_ frame: ProtoPipe_V1_RequestPacket.OneOf_Frame, reqID: UInt64) {
+        let data = Self.encode(frame, reqID: reqID)
+        self.state.withLock { $0.outbox.append(data) }
+        self.flush()
+    }
+
+    /// Drain the outbox into `sendData`, one packet at a time and in queue order. Only one
+    /// thread drains at once: a concurrent (or re-entrant, from inside `sendData`) caller
+    /// just leaves its packet for the active drainer. `sendData` runs outside the lock.
+    func flush() {
+        let shouldDrain = self.state.withLock { state -> Bool in
+            guard !state.isFlushing else { return false }
+            state.isFlushing = true
             return true
+        }
+        guard shouldDrain else { return }
+        while let data = self.state.withLock({ state -> Data? in
+            guard !state.outbox.isEmpty else {
+                state.isFlushing = false
+                return nil
+            }
+            return state.outbox.removeFirst()
+        }) {
+            self.sendData(data)
         }
     }
 
-    func sendFrame(_ frame: ProtoPipe_V1_RequestPacket.OneOf_Frame, reqID: UInt64) {
+    private static func encode(
+        _ frame: ProtoPipe_V1_RequestPacket.OneOf_Frame,
+        reqID: UInt64
+    ) -> Data {
         var packet = ProtoPipe_V1_RequestPacket()
         packet.reqID = reqID
         packet.frame = frame
-        self.sendData(try! packet.serializedData())
+        return try! packet.serializedData()
     }
 
     /// Locally end a call: remove its session, optionally send Cancel, deliver the close.
@@ -240,41 +281,47 @@ public final class PipeClient: @unchecked Sendable {
         responseStreaming: Bool,
         onResult: @escaping @Sendable (StreamResult<Output>) -> Void
     ) -> PipeStreamCore {
-        let reqID = self.allocateReqID()
-        let session: Session = responseStreaming
-            ? self.streamingResponseSession(reqID: reqID, onResult: onResult)
-            : self.singleResponseSession(onResult: onResult)
-        let core = PipeStreamCore(client: self, reqID: reqID)
-        guard self.insert(session, reqID: reqID) else {
-            onResult(Self.streamComplete(from: .local(.unavailable, "pipe is shut down")))
-            return core
-        }
         var begin = ProtoPipe_V1_RequestPacket.Begin()
         begin.method = wireMethod(from: path)
         begin.headers = packetMetadata(from: headers)
-        self.sendFrame(.begin(begin), reqID: reqID)
-        return core
+        let reqID = self.queueCall(begin) { reqID in
+            responseStreaming
+                ? self.streamingResponseSession(reqID: reqID, onResult: onResult)
+                : self.singleResponseSession(onResult: onResult)
+        }
+        guard let reqID else {
+            onResult(Self.streamComplete(from: .local(.unavailable, "pipe is shut down")))
+            return PipeStreamCore(client: self, reqID: nil)
+        }
+        self.flush()
+        return PipeStreamCore(client: self, reqID: reqID)
     }
 
     /// Open a server-only call. Begin (carrying the single request) is deferred until
-    /// the handle's one `send`, matching connect-swift's server-only semantics.
+    /// the handle's one `send`, matching connect-swift's server-only semantics -- and so
+    /// are the req_id and session, which `queueCall` assigns at that point so the Begin
+    /// can't be overtaken on the wire by calls started in between.
     func openServerOnlyStream<Output: ProtobufMessage>(
         path: String,
         headers: Headers,
         onResult: @escaping @Sendable (StreamResult<Output>) -> Void
     ) -> PipeStreamCore {
-        let reqID = self.allocateReqID()
-        let session: Session = self.streamingResponseSession(reqID: reqID, onResult: onResult)
-        let core = PipeStreamCore(
+        return PipeStreamCore(
             client: self,
-            reqID: reqID,
-            pendingBegin: (wireMethod(from: path), headers)
+            pendingBegin: PipeStreamCore.PendingBegin(
+                method: wireMethod(from: path),
+                headers: headers,
+                // The core already holds the client strongly; no cycle back to it.
+                start: { begin in
+                    self.queueCall(begin) { reqID in
+                        self.streamingResponseSession(reqID: reqID, onResult: onResult)
+                    }
+                },
+                fail: { code, message in
+                    onResult(Self.streamComplete(from: .local(code, message)))
+                }
+            )
         )
-        guard self.insert(session, reqID: reqID) else {
-            onResult(Self.streamComplete(from: .local(.unavailable, "pipe is shut down")))
-            return core
-        }
-        return core
     }
 
     private static func unaryResponse<Output: ProtobufMessage>(
@@ -344,23 +391,21 @@ extension PipeClient: ProtocolClientInterface {
             return Cancelable {}
         }
 
-        let reqID = self.allocateReqID()
+        var begin = ProtoPipe_V1_RequestPacket.Begin()
+        begin.method = wireMethod(from: path)
+        begin.headers = packetMetadata(from: headers)
+        begin.singleRequest = requestBytes
         let session = Session(
             acceptsMessages: false,
             onHeaders: { _ in },
             onMessage: { _ in },
             onClose: { completion(Self.unaryResponse(from: $0)) }
         )
-        guard self.insert(session, reqID: reqID) else {
+        guard let reqID = self.queueCall(begin, session: { _ in session }) else {
             completion(Self.unaryResponse(from: .local(.unavailable, "pipe is shut down")))
             return Cancelable {}
         }
-
-        var begin = ProtoPipe_V1_RequestPacket.Begin()
-        begin.method = wireMethod(from: path)
-        begin.headers = packetMetadata(from: headers)
-        begin.singleRequest = requestBytes
-        self.sendFrame(.begin(begin), reqID: reqID)
+        self.flush()
         return Cancelable { [weak self] in self?.cancelCall(reqID) }
     }
 

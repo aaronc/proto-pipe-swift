@@ -424,6 +424,73 @@ private final class Box<T>: @unchecked Sendable {
     ])
 }
 
+// The server drops the whole connection if req_ids on the wire ever go backwards, so
+// Begins must leave in allocation order even when calls start on many threads at once.
+@Test private func concurrentCallsSendBeginsInReqIDOrder() {
+    let server = ScriptedServer()
+    let calls = 500
+    DispatchQueue.concurrentPerform(iterations: calls) { _ in
+        server.client.unary(
+            path: "pkg.Svc/Echo", idempotencyLevel: .unknown, request: msg("in"), headers: [:]
+        ) { (_: ResponseMessage<Msg>) in }
+    }
+    #expect(server.packets.map(\.reqID) == Array(1...UInt64(calls)))
+}
+
+@Test private func serverOnlyBeginIsNotOvertakenByLaterCalls() {
+    let server = ScriptedServer()
+    let results = Box<StreamResult<Msg>>()
+    let stream: any ServerOnlyStreamInterface<Msg> = server.client.serverOnlyStream(
+        path: "pkg.Svc/Watch", headers: [:]
+    ) { results.append($0) }
+    // A call started between open and send must not leave the stream holding a
+    // lower req_id than one already on the wire.
+    server.client.unary(
+        path: "pkg.Svc/Echo", idempotencyLevel: .unknown, request: msg("in"), headers: [:]
+    ) { (_: ResponseMessage<Msg>) in }
+    stream.send(msg("query"))
+
+    #expect(server.packets.map(\.reqID) == [1, 2])
+    server.respondMessage(2, msg("r"))
+    #expect(results.all == [.message(msg("r"))])
+}
+
+@Test private func serverOnlyCancelBeforeSendCompletesLocally() {
+    let server = ScriptedServer()
+    let results = Box<StreamResult<Msg>>()
+    let stream: any ServerOnlyStreamInterface<Msg> = server.client.serverOnlyStream(
+        path: "pkg.Svc/Watch", headers: [:]
+    ) { results.append($0) }
+
+    stream.cancel()
+    stream.send(msg("query"))
+    // Never reached the server: no Begin, no Cancel on the wire.
+    #expect(server.packets.isEmpty)
+    #expect(results.all == [.complete(code: .canceled, error: nil, trailers: nil)])
+}
+
+@Test private func reentrantSendKeepsOrderWithoutDeadlock() {
+    let sent = Box<UInt64>()
+    let clientBox = Box<PipeClient>()
+    let client = PipeClient { data in
+        let packet = try! ProtoPipe_V1_RequestPacket(serializedBytes: data)
+        sent.append(packet.reqID)
+        // Start another call from inside the pipe's send callback, as a synchronous
+        // loopback transport could.
+        if packet.reqID == 1, let client = clientBox.all.first {
+            client.unary(
+                path: "pkg.Svc/Echo", idempotencyLevel: .unknown, request: msg("inner"), headers: [:]
+            ) { (_: ResponseMessage<Msg>) in }
+        }
+    }
+    clientBox.append(client)
+    client.unary(
+        path: "pkg.Svc/Echo", idempotencyLevel: .unknown, request: msg("outer"), headers: [:]
+    ) { (_: ResponseMessage<Msg>) in }
+
+    #expect(sent.all == [1, 2])
+}
+
 @Test private func framesForUnknownReqIDAreDropped() {
     let server = ScriptedServer()
     server.respondClose(42, singleResponse: msg("ghost"))

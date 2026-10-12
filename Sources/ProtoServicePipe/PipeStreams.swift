@@ -9,72 +9,109 @@ import SwiftProtobuf
 /// the wire protocol requires the server to ignore.
 final class PipeStreamCore: @unchecked Sendable {
     private let client: PipeClient
-    private let reqID: UInt64
     private let sendHalf: Locked<SendHalf>
 
-    private enum SendHalf {
-        /// Server-only call whose Begin (with the single request) has not been sent yet.
-        case pendingBegin(method: String, headers: Headers)
-        case open
-        case closed
+    /// A server-only call before its Begin: what to send, and how to start or fail it.
+    struct PendingBegin {
+        let method: String
+        let headers: Headers
+        /// Atomically allocates the req_id, registers the session and queues the Begin
+        /// (`PipeClient.queueCall`); nil if the client is shut down. Does not flush.
+        let start: @Sendable (ProtoPipe_V1_RequestPacket.Begin) -> UInt64?
+        /// Completes the call locally (cancelled before Begin, or shut down).
+        let fail: @Sendable (Code, String?) -> Void
     }
 
-    init(client: PipeClient, reqID: UInt64, pendingBegin: (String, Headers)? = nil) {
+    private enum SendHalf {
+        /// Server-only call whose Begin (with the single request) has not been sent yet;
+        /// it has no req_id until then.
+        case pendingBegin(PendingBegin)
+        case open(reqID: UInt64)
+        /// nil req_id: the call never started (shut down, or cancelled before Begin).
+        case closed(reqID: UInt64?)
+    }
+
+    /// A call whose Begin is already queued; nil `reqID` when the client was shut down.
+    init(client: PipeClient, reqID: UInt64?) {
         self.client = client
-        self.reqID = reqID
-        self.sendHalf = Locked(
-            pendingBegin.map { .pendingBegin(method: $0.0, headers: $0.1) } ?? .open
-        )
+        self.sendHalf = Locked(reqID.map { .open(reqID: $0) } ?? .closed(reqID: nil))
+    }
+
+    init(client: PipeClient, pendingBegin: PendingBegin) {
+        self.client = client
+        self.sendHalf = Locked(.pendingBegin(pendingBegin))
     }
 
     /// Send one streamed request message. Sending after close is a caller precondition
     /// violation and is dropped; only encoding failures throw.
     func sendMessage(_ input: some ProtobufMessage) throws {
         let body = try input.serializedData()
-        let isOpen = self.sendHalf.withLock { half in
-            if case .open = half { return true }
-            return false
+        let reqID = self.sendHalf.withLock { half -> UInt64? in
+            if case .open(let reqID) = half { return reqID }
+            return nil
         }
-        guard isOpen, self.client.hasSession(self.reqID) else { return }
+        guard let reqID, self.client.hasSession(reqID) else { return }
         var message = ProtoPipe_V1_RequestPacket.Message()
         message.body = body
-        self.client.sendFrame(.message(message), reqID: self.reqID)
+        self.client.sendFrame(.message(message), reqID: reqID)
     }
 
     /// Send the single request of a server-only call as its Begin frame. At most once;
     /// later calls are dropped. Only encoding failures throw.
     func sendSingleRequest(_ input: some ProtobufMessage) throws {
         let body = try input.serializedData()
-        let pending: (String, Headers)? = self.sendHalf.withLock { half in
-            guard case .pendingBegin(let method, let headers) = half else { return nil }
-            half = .closed
-            return (method, headers)
+        // Start under the send-half lock so a racing cancel sees either the pending call
+        // or its req_id, never neither. `start` only queues; flushing (which may re-enter
+        // via `send`) happens after the lock is released.
+        let started = self.sendHalf.withLock { half -> (PendingBegin, UInt64?)? in
+            guard case .pendingBegin(let pending) = half else { return nil }
+            var begin = ProtoPipe_V1_RequestPacket.Begin()
+            begin.method = pending.method
+            begin.headers = packetMetadata(from: pending.headers)
+            begin.singleRequest = body
+            let reqID = pending.start(begin)
+            half = .closed(reqID: reqID)
+            return (pending, reqID)
         }
-        guard let (method, headers) = pending, self.client.hasSession(self.reqID) else { return }
-        var begin = ProtoPipe_V1_RequestPacket.Begin()
-        begin.method = method
-        begin.headers = packetMetadata(from: headers)
-        begin.singleRequest = body
-        self.client.sendFrame(.begin(begin), reqID: self.reqID)
+        guard let (pending, reqID) = started else { return }
+        if reqID == nil {
+            pending.fail(.unavailable, "pipe is shut down")
+        } else {
+            self.client.flush()
+        }
     }
 
     /// Close the send half (DoneSending). The response direction stays open.
     func closeSend() {
-        let wasOpen = self.sendHalf.withLock { half in
-            if case .open = half {
-                half = .closed
-                return true
-            }
-            return false
+        let reqID = self.sendHalf.withLock { half -> UInt64? in
+            guard case .open(let reqID) = half else { return nil }
+            half = .closed(reqID: reqID)
+            return reqID
         }
-        guard wasOpen, self.client.hasSession(self.reqID) else { return }
-        self.client.sendFrame(.doneSending(.init()), reqID: self.reqID)
+        guard let reqID, self.client.hasSession(reqID) else { return }
+        self.client.sendFrame(.doneSending(.init()), reqID: reqID)
     }
 
     /// Abort the call in both directions; the caller sees `.complete(code: .canceled)`.
     func cancel() {
-        self.sendHalf.withLock { $0 = .closed }
-        self.client.cancelCall(self.reqID)
+        let previous = self.sendHalf.withLock { half -> SendHalf in
+            let previous = half
+            switch half {
+            case .pendingBegin: half = .closed(reqID: nil)
+            case .open(let reqID): half = .closed(reqID: reqID)
+            case .closed: break
+            }
+            return previous
+        }
+        switch previous {
+        case .pendingBegin(let pending):
+            // Never reached the server: nothing to Cancel on the wire.
+            pending.fail(.canceled, nil)
+        case .open(let reqID), .closed(reqID: let reqID?):
+            self.client.cancelCall(reqID)
+        case .closed(reqID: nil):
+            break
+        }
     }
 }
 
